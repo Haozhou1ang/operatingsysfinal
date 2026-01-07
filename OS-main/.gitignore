@@ -1,0 +1,69 @@
+############################
+# OS / Editor local files
+############################
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# VS Code（建议只保留源码，不提交本地配置）
+.vscode/
+
+# VS Code Local History extension
+.history/
+
+############################
+# Build outputs / binaries
+############################
+*.exe
+*.out
+*.app
+
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+
+*.pdb
+*.ilk
+*.idb
+*.ipch
+*.pch
+*.exp
+*.tlog
+*.log
+
+############################
+# CMake generated files
+############################
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+
+# Common build directories
+build/
+cmake-build-*/
+out/
+
+############################
+# Visual Studio generated
+############################
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.vc.db
+
+############################
+# Repo-specific generated artifacts
+############################
+/server/build/
+/filesystem/bin/
+/filesystem/disk/disk.img
