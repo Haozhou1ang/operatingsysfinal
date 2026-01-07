@@ -200,6 +200,8 @@ struct Superblock {
     uint32_t inode_bitmap_blocks;        // inode 位图占用块数
     BlockNo block_bitmap_start;          // 块位图起始块
     uint32_t block_bitmap_blocks;        // 块位图占用块数
+    BlockNo refcount_table_start;        // 引用计数表起始块
+    uint32_t refcount_table_blocks;      // 引用计数表占用块数
     BlockNo inode_table_start;           // inode 表起始块
     
     // ===== 使用统计 (16 bytes) =====
@@ -228,7 +230,7 @@ struct Superblock {
     InodeId root_inode;                  // 根目录 inode 编号
     
     // ===== 预留空间 =====
-    uint8_t reserved[BLOCK_SIZE - 112];  // 填充至 1024 字节
+    uint8_t reserved[BLOCK_SIZE - 120];  // 填充至 1024 字节
     
     // ===== 方法 =====
     void init(uint32_t total_blks, uint32_t total_inds);
@@ -482,10 +484,26 @@ inline void Superblock::init(uint32_t total_blks, uint32_t total_inds) {
     
     block_bitmap_start = inode_bitmap_start + inode_bitmap_blocks;
     block_bitmap_blocks = (total_blocks + BLOCK_SIZE * 8 - 1) / (BLOCK_SIZE * 8);
-    
-    inode_table_start = block_bitmap_start + block_bitmap_blocks;
+
+    refcount_table_start = block_bitmap_start + block_bitmap_blocks;
     uint32_t inode_table_blocks = (total_inodes + INODES_PER_BLOCK - 1) / INODES_PER_BLOCK;
-    
+
+    uint32_t meta_without_ref = refcount_table_start + inode_table_blocks;
+    uint32_t data_blocks = total_blocks - meta_without_ref;
+    uint32_t refcount_blocks = (data_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    while (true) {
+        uint32_t new_data_blocks = total_blocks - (meta_without_ref + refcount_blocks);
+        uint32_t new_refcount_blocks = (new_data_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        if (new_refcount_blocks == refcount_blocks) {
+            data_blocks = new_data_blocks;
+            break;
+        }
+        refcount_blocks = new_refcount_blocks;
+    }
+
+    refcount_table_blocks = refcount_blocks;
+    inode_table_start = refcount_table_start + refcount_table_blocks;
     data_block_start = inode_table_start + inode_table_blocks;
     data_block_count = total_blocks - data_block_start;
     

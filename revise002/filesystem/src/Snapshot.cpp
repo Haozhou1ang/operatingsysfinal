@@ -428,6 +428,77 @@ uint32_t SnapshotManager::getSnapshotCount() const {
     return static_cast<uint32_t>(snapshots_.size());
 }
 
+ErrorCode SnapshotManager::rebuildBlockRefcounts() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (!loaded_ || !alloc_) {
+        return ErrorCode::E_INVALID_PARAM;
+    }
+
+    ErrorCode err = alloc_->resetBlockRefcounts();
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    const Superblock& sb = alloc_->getSuperblock();
+    if (sb.snapshot_list_block != 0 && sb.snapshot_list_block != INVALID_BLOCK) {
+        auto ref_result = alloc_->incBlockRef(sb.snapshot_list_block);
+        if (!ref_result.ok()) {
+            return ref_result.error();
+        }
+    }
+
+    std::unordered_set<InodeId> visited;
+    err = rebuildForInode(sb.root_inode, visited);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    for (const auto& snapshot : snapshots_) {
+        if (!snapshot.valid) {
+            continue;
+        }
+        err = rebuildForInode(snapshot.root_inode, visited);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+    }
+
+    return ErrorCode::OK;
+}
+
+ErrorCode SnapshotManager::collectUsage(std::unordered_set<InodeId>& used_inodes,
+                                        std::unordered_set<BlockNo>& used_blocks) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (!loaded_ || !alloc_) {
+        return ErrorCode::E_INVALID_PARAM;
+    }
+
+    const Superblock& sb = alloc_->getSuperblock();
+    if (sb.snapshot_list_block != 0 && sb.snapshot_list_block != INVALID_BLOCK) {
+        used_blocks.insert(sb.snapshot_list_block);
+    }
+
+    std::unordered_set<InodeId> visited;
+    ErrorCode err = collectForInode(sb.root_inode, visited, used_inodes, used_blocks);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    for (const auto& snapshot : snapshots_) {
+        if (!snapshot.valid) {
+            continue;
+        }
+        err = collectForInode(snapshot.root_inode, visited, used_inodes, used_blocks);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+    }
+
+    return ErrorCode::OK;
+}
+
 //==============================================================================
 // COW (Copy-on-Write) 接口
 //==============================================================================
@@ -522,7 +593,9 @@ ErrorCode SnapshotManager::incrementBlockRefs(const Inode& inode) {
 
     // 一级间接块
     if (inode.single_indirect != INVALID_BLOCK) {
-        alloc_->incBlockRef(inode.single_indirect);
+        if (count_indirect_blocks_) {
+            alloc_->incBlockRef(inode.single_indirect);
+        }
         
         uint8_t block_data[BLOCK_SIZE];
         if (readBlockInternal(inode.single_indirect, block_data) == ErrorCode::OK) {
@@ -538,7 +611,9 @@ ErrorCode SnapshotManager::incrementBlockRefs(const Inode& inode) {
 
     // 二级间接块
     if (inode.double_indirect != INVALID_BLOCK) {
-        alloc_->incBlockRef(inode.double_indirect);
+        if (count_indirect_blocks_) {
+            alloc_->incBlockRef(inode.double_indirect);
+        }
         
         uint8_t l1_data[BLOCK_SIZE];
         if (readBlockInternal(inode.double_indirect, l1_data) == ErrorCode::OK) {
@@ -546,7 +621,9 @@ ErrorCode SnapshotManager::incrementBlockRefs(const Inode& inode) {
             
             for (uint32_t i = 0; i < PTRS_PER_BLOCK; ++i) {
                 if (l1_ptrs[i] != INVALID_BLOCK) {
-                    alloc_->incBlockRef(l1_ptrs[i]);
+                    if (count_indirect_blocks_) {
+                        alloc_->incBlockRef(l1_ptrs[i]);
+                    }
                     
                     uint8_t l2_data[BLOCK_SIZE];
                     if (readBlockInternal(l1_ptrs[i], l2_data) == ErrorCode::OK) {
@@ -585,7 +662,9 @@ ErrorCode SnapshotManager::decrementBlockRefs(const Inode& inode) {
                 }
             }
         }
-        alloc_->decBlockRef(inode.single_indirect);
+        if (count_indirect_blocks_) {
+            alloc_->decBlockRef(inode.single_indirect);
+        }
     }
 
     // 二级间接块
@@ -605,11 +684,236 @@ ErrorCode SnapshotManager::decrementBlockRefs(const Inode& inode) {
                             }
                         }
                     }
-                    alloc_->decBlockRef(l1_ptrs[i]);
+                    if (count_indirect_blocks_) {
+                        alloc_->decBlockRef(l1_ptrs[i]);
+                    }
                 }
             }
         }
-        alloc_->decBlockRef(inode.double_indirect);
+        if (count_indirect_blocks_) {
+            alloc_->decBlockRef(inode.double_indirect);
+        }
+    }
+
+    return ErrorCode::OK;
+}
+
+ErrorCode SnapshotManager::incrementBlockRefsNoStats(const Inode& inode) {
+    for (uint32_t i = 0; i < NUM_DIRECT_BLOCKS; ++i) {
+        if (inode.direct_blocks[i] != INVALID_BLOCK) {
+            auto result = alloc_->incBlockRef(inode.direct_blocks[i]);
+            if (!result.ok()) {
+                return result.error();
+            }
+        }
+    }
+
+    if (inode.single_indirect != INVALID_BLOCK) {
+        if (count_indirect_blocks_) {
+            auto result = alloc_->incBlockRef(inode.single_indirect);
+            if (!result.ok()) {
+                return result.error();
+            }
+        }
+
+        uint8_t block_data[BLOCK_SIZE];
+        if (readBlockInternal(inode.single_indirect, block_data) == ErrorCode::OK) {
+            BlockNo* ptrs = reinterpret_cast<BlockNo*>(block_data);
+            for (uint32_t i = 0; i < PTRS_PER_BLOCK; ++i) {
+                if (ptrs[i] != INVALID_BLOCK) {
+                    auto ref_result = alloc_->incBlockRef(ptrs[i]);
+                    if (!ref_result.ok()) {
+                        return ref_result.error();
+                    }
+                }
+            }
+        }
+    }
+
+    if (inode.double_indirect != INVALID_BLOCK) {
+        if (count_indirect_blocks_) {
+            auto result = alloc_->incBlockRef(inode.double_indirect);
+            if (!result.ok()) {
+                return result.error();
+            }
+        }
+
+        uint8_t l1_data[BLOCK_SIZE];
+        if (readBlockInternal(inode.double_indirect, l1_data) == ErrorCode::OK) {
+            BlockNo* l1_ptrs = reinterpret_cast<BlockNo*>(l1_data);
+            for (uint32_t i = 0; i < PTRS_PER_BLOCK; ++i) {
+                if (l1_ptrs[i] != INVALID_BLOCK) {
+                    if (count_indirect_blocks_) {
+                        auto result = alloc_->incBlockRef(l1_ptrs[i]);
+                        if (!result.ok()) {
+                            return result.error();
+                        }
+                    }
+
+                    uint8_t l2_data[BLOCK_SIZE];
+                    if (readBlockInternal(l1_ptrs[i], l2_data) == ErrorCode::OK) {
+                        BlockNo* l2_ptrs = reinterpret_cast<BlockNo*>(l2_data);
+                        for (uint32_t j = 0; j < PTRS_PER_BLOCK; ++j) {
+                            if (l2_ptrs[j] != INVALID_BLOCK) {
+                                auto ref_result = alloc_->incBlockRef(l2_ptrs[j]);
+                                if (!ref_result.ok()) {
+                                    return ref_result.error();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return ErrorCode::OK;
+}
+
+ErrorCode SnapshotManager::rebuildForInode(InodeId inode_id,
+                                           std::unordered_set<InodeId>& visited) {
+    if (inode_id == INVALID_INODE) {
+        return ErrorCode::OK;
+    }
+    if (visited.find(inode_id) != visited.end()) {
+        return ErrorCode::OK;
+    }
+    visited.insert(inode_id);
+
+    auto inode_result = alloc_->readInode(inode_id);
+    if (!inode_result.ok()) {
+        return inode_result.error();
+    }
+    const Inode& inode = inode_result.value();
+
+    ErrorCode err = incrementBlockRefsNoStats(inode);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    if (!inode.isDirectory()) {
+        return ErrorCode::OK;
+    }
+
+    uint32_t num_blocks = (inode.size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (num_blocks == 0) num_blocks = 1;
+    DirEntry entries[DIRENTRIES_PER_BLOCK];
+
+    for (uint32_t bi = 0; bi < num_blocks; ++bi) {
+        auto block_result = getFileBlock(inode, bi);
+        if (!block_result.ok()) {
+            continue;
+        }
+        ErrorCode read_err = readBlockInternal(block_result.value(), entries);
+        if (read_err != ErrorCode::OK) {
+            return read_err;
+        }
+        for (uint32_t i = 0; i < DIRENTRIES_PER_BLOCK; ++i) {
+            if (!entries[i].isValid()) continue;
+            std::string name = entries[i].getName();
+            if (name == "." || name == "..") continue;
+            err = rebuildForInode(entries[i].inode, visited);
+            if (err != ErrorCode::OK) {
+                return err;
+            }
+        }
+    }
+
+    return ErrorCode::OK;
+}
+
+ErrorCode SnapshotManager::collectForInode(InodeId inode_id,
+                                           std::unordered_set<InodeId>& visited,
+                                           std::unordered_set<InodeId>& used_inodes,
+                                           std::unordered_set<BlockNo>& used_blocks) const {
+    if (inode_id == INVALID_INODE) {
+        return ErrorCode::OK;
+    }
+    if (visited.find(inode_id) != visited.end()) {
+        return ErrorCode::OK;
+    }
+    visited.insert(inode_id);
+    used_inodes.insert(inode_id);
+
+    auto inode_result = alloc_->readInode(inode_id);
+    if (!inode_result.ok()) {
+        return inode_result.error();
+    }
+    const Inode& inode = inode_result.value();
+
+    for (uint32_t i = 0; i < NUM_DIRECT_BLOCKS; ++i) {
+        if (inode.direct_blocks[i] != INVALID_BLOCK) {
+            used_blocks.insert(inode.direct_blocks[i]);
+        }
+    }
+
+    if (inode.single_indirect != INVALID_BLOCK) {
+        if (count_indirect_blocks_) {
+            used_blocks.insert(inode.single_indirect);
+        }
+        uint8_t block_data[BLOCK_SIZE];
+        if (readBlockInternal(inode.single_indirect, block_data) == ErrorCode::OK) {
+            BlockNo* ptrs = reinterpret_cast<BlockNo*>(block_data);
+            for (uint32_t i = 0; i < PTRS_PER_BLOCK; ++i) {
+                if (ptrs[i] != INVALID_BLOCK) {
+                    used_blocks.insert(ptrs[i]);
+                }
+            }
+        }
+    }
+
+    if (inode.double_indirect != INVALID_BLOCK) {
+        if (count_indirect_blocks_) {
+            used_blocks.insert(inode.double_indirect);
+        }
+        uint8_t l1_data[BLOCK_SIZE];
+        if (readBlockInternal(inode.double_indirect, l1_data) == ErrorCode::OK) {
+            BlockNo* l1_ptrs = reinterpret_cast<BlockNo*>(l1_data);
+            for (uint32_t i = 0; i < PTRS_PER_BLOCK; ++i) {
+                if (l1_ptrs[i] != INVALID_BLOCK) {
+                    if (count_indirect_blocks_) {
+                        used_blocks.insert(l1_ptrs[i]);
+                    }
+                    uint8_t l2_data[BLOCK_SIZE];
+                    if (readBlockInternal(l1_ptrs[i], l2_data) == ErrorCode::OK) {
+                        BlockNo* l2_ptrs = reinterpret_cast<BlockNo*>(l2_data);
+                        for (uint32_t j = 0; j < PTRS_PER_BLOCK; ++j) {
+                            if (l2_ptrs[j] != INVALID_BLOCK) {
+                                used_blocks.insert(l2_ptrs[j]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!inode.isDirectory()) {
+        return ErrorCode::OK;
+    }
+
+    uint32_t num_blocks = (inode.size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (num_blocks == 0) num_blocks = 1;
+    DirEntry entries[DIRENTRIES_PER_BLOCK];
+
+    for (uint32_t bi = 0; bi < num_blocks; ++bi) {
+        auto block_result = getFileBlock(inode, bi);
+        if (!block_result.ok()) {
+            continue;
+        }
+        ErrorCode read_err = readBlockInternal(block_result.value(), entries);
+        if (read_err != ErrorCode::OK) {
+            return read_err;
+        }
+        for (uint32_t i = 0; i < DIRENTRIES_PER_BLOCK; ++i) {
+            if (!entries[i].isValid()) continue;
+            std::string name = entries[i].getName();
+            if (name == "." || name == "..") continue;
+            ErrorCode err = collectForInode(entries[i].inode, visited, used_inodes, used_blocks);
+            if (err != ErrorCode::OK) {
+                return err;
+            }
+        }
     }
 
     return ErrorCode::OK;

@@ -5,6 +5,7 @@
 #include "FSTypes.h"
 #include "DiskImage.h"
 #include <vector>
+#include <unordered_set>
 #include <mutex>
 #include <memory>
 
@@ -68,6 +69,7 @@ public:
     // 引用计数接口
     //==========================================================================
 
+    ErrorCode resetBlockRefcounts();
     Result<uint32_t> incBlockRef(BlockNo block_no);
     Result<uint32_t> decBlockRef(BlockNo block_no);
     uint32_t getBlockRef(BlockNo block_no) const;
@@ -91,6 +93,9 @@ public:
     //==========================================================================
 
     ErrorCode checkConsistency(bool fix = false);
+    ErrorCode reconcileUsage(const std::unordered_set<InodeId>& used_inodes,
+                              const std::unordered_set<BlockNo>& used_blocks,
+                              bool fix = false);
 
     struct AllocStats {
         uint32_t inode_allocs;
@@ -130,8 +135,10 @@ private:
     // 位图操作
     ErrorCode loadInodeBitmap();
     ErrorCode loadBlockBitmap();
+    ErrorCode loadRefcountTable();
     ErrorCode saveInodeBitmap();
     ErrorCode saveBlockBitmap();
+    ErrorCode saveRefcountTable();
 
     // 内部写入 inode（不加锁）
     ErrorCode writeInodeInternal(InodeId inode_id, const Inode& inode);
@@ -169,6 +176,7 @@ private:
     std::vector<uint8_t> block_bitmap_;
     bool inode_bitmap_dirty_;
     bool block_bitmap_dirty_;
+    bool refcount_dirty_;
     bool superblock_dirty_;
 
     // 引用计数表

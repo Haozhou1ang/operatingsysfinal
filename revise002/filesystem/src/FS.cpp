@@ -4,6 +4,7 @@
 #include <sstream>
 #include <iostream>
 #include <iomanip>
+#include <unordered_set>
 #include <ctime>
 
 namespace fs {
@@ -104,6 +105,16 @@ ErrorCode FileSystem::mount(const std::string& path, const FSConfig& config) {
     }
 
     err = snap_->load();
+    if (err != ErrorCode::OK) {
+        snap_.reset();
+        dir_.reset();
+        alloc_.reset();
+        cached_disk_.reset();
+        disk_->close();
+        disk_.reset();
+        return err;
+    }
+    err = snap_->rebuildBlockRefcounts();
     if (err != ErrorCode::OK) {
         snap_.reset();
         dir_.reset();
@@ -516,7 +527,17 @@ ErrorCode FileSystem::createSnapshot(const std::string& name) {
     if (alloc_) alloc_->sync();
     if (cached_disk_) cached_disk_->flush();
 
-    return snap_->createSnapshot(name);
+    err = snap_->createSnapshot(name);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    err = alloc_->checkConsistency(false);
+    if (err != ErrorCode::OK) {
+        return snap_->rebuildBlockRefcounts();
+    }
+
+    return ErrorCode::OK;
 }
 
 ErrorCode FileSystem::restoreSnapshot(const std::string& name) {
@@ -531,7 +552,12 @@ ErrorCode FileSystem::restoreSnapshot(const std::string& name) {
     }
 
     // 重新加载分配器状态
-    return alloc_->reload();
+    err = alloc_->reload();
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    return snap_->rebuildBlockRefcounts();
 }
 
 ErrorCode FileSystem::deleteSnapshot(const std::string& name) {
@@ -540,7 +566,17 @@ ErrorCode FileSystem::deleteSnapshot(const std::string& name) {
     ErrorCode err = ensureMounted();
     if (err != ErrorCode::OK) return err;
 
-    return snap_->deleteSnapshot(name);
+    err = snap_->deleteSnapshot(name);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    err = alloc_->checkConsistency(false);
+    if (err != ErrorCode::OK) {
+        return snap_->rebuildBlockRefcounts();
+    }
+
+    return ErrorCode::OK;
 }
 
 std::vector<SnapshotInfo> FileSystem::listSnapshots() const {
@@ -755,7 +791,27 @@ ErrorCode FileSystem::checkConsistency(bool fix) {
     ErrorCode err = ensureMounted();
     if (err != ErrorCode::OK) return err;
 
-    return alloc_->checkConsistency(fix);
+    bool has_error = false;
+    err = alloc_->checkConsistency(fix);
+    if (err != ErrorCode::OK) {
+        has_error = true;
+    }
+
+    if (snap_) {
+        std::unordered_set<InodeId> used_inodes;
+        std::unordered_set<BlockNo> used_blocks;
+        err = snap_->collectUsage(used_inodes, used_blocks);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+
+        err = alloc_->reconcileUsage(used_inodes, used_blocks, fix);
+        if (err != ErrorCode::OK) {
+            has_error = true;
+        }
+    }
+
+    return has_error ? ErrorCode::E_INTERNAL : ErrorCode::OK;
 }
 
 void FileSystem::printTree(const std::string& path, int max_depth) {
