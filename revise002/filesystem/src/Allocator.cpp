@@ -18,6 +18,7 @@ Allocator::Allocator(DiskImage* disk)
     , loaded_(false)
     , inode_bitmap_dirty_(false)
     , block_bitmap_dirty_(false)
+    , refcount_dirty_(false)
     , superblock_dirty_(false)
     , refcount_enabled_(false)
     , stats_{0, 0, 0, 0, 0, 0}
@@ -32,6 +33,7 @@ Allocator::Allocator(CachedDisk* cached_disk)
     , loaded_(false)
     , inode_bitmap_dirty_(false)
     , block_bitmap_dirty_(false)
+    , refcount_dirty_(false)
     , superblock_dirty_(false)
     , refcount_enabled_(false)
     , stats_{0, 0, 0, 0, 0, 0}
@@ -119,13 +121,24 @@ ErrorCode Allocator::load() {
     }
 
     // 初始化引用计数表
-    block_refcount_.resize(superblock_.data_block_count, 1);
-    refcount_enabled_ = true;
+    if (superblock_.refcount_table_blocks > 0) {
+        err = loadRefcountTable();
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        refcount_enabled_ = true;
+        refcount_dirty_ = false;
+    } else {
+        block_refcount_.assign(superblock_.data_block_count, 0);
+        refcount_enabled_ = true;
+        refcount_dirty_ = false;
+    }
 
     loaded_ = true;
     inode_bitmap_dirty_ = false;
     block_bitmap_dirty_ = false;
     superblock_dirty_ = false;
+    refcount_dirty_ = false;
 
     return ErrorCode::OK;
 }
@@ -155,6 +168,14 @@ ErrorCode Allocator::sync() {
             return err;
         }
         block_bitmap_dirty_ = false;
+    }
+
+    if (refcount_dirty_) {
+        err = saveRefcountTable();
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        refcount_dirty_ = false;
     }
 
     // 保存 superblock（直接写磁盘，确保一致性）
@@ -223,6 +244,24 @@ ErrorCode Allocator::loadBlockBitmap() {
     return ErrorCode::OK;
 }
 
+ErrorCode Allocator::loadRefcountTable() {
+    uint32_t table_size = superblock_.refcount_table_blocks * BLOCK_SIZE;
+    block_refcount_.resize(table_size);
+
+    for (uint32_t i = 0; i < superblock_.refcount_table_blocks; ++i) {
+        ErrorCode err = readBlockInternal(
+            superblock_.refcount_table_start + i,
+            block_refcount_.data() + i * BLOCK_SIZE
+        );
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+    }
+
+    block_refcount_.resize(superblock_.data_block_count);
+    return ErrorCode::OK;
+}
+
 ErrorCode Allocator::saveInodeBitmap() {
     for (uint32_t i = 0; i < superblock_.inode_bitmap_blocks; ++i) {
         ErrorCode err = writeBlockInternal(
@@ -253,6 +292,29 @@ ErrorCode Allocator::saveBlockBitmap() {
     return ErrorCode::OK;
 }
 
+ErrorCode Allocator::saveRefcountTable() {
+    if (superblock_.refcount_table_blocks == 0) {
+        return ErrorCode::OK;
+    }
+
+    std::vector<uint8_t> table(superblock_.refcount_table_blocks * BLOCK_SIZE, 0);
+    if (!block_refcount_.empty()) {
+        std::memcpy(table.data(), block_refcount_.data(),
+                    std::min(table.size(), block_refcount_.size()));
+    }
+
+    for (uint32_t i = 0; i < superblock_.refcount_table_blocks; ++i) {
+        ErrorCode err = writeBlockInternal(
+            superblock_.refcount_table_start + i,
+            table.data() + i * BLOCK_SIZE
+        );
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+    }
+
+    return ErrorCode::OK;
+}
 //==============================================================================
 // Inode 分配接口
 //==============================================================================
@@ -423,6 +485,7 @@ Result<BlockNo> Allocator::allocBlock() {
 
     if (refcount_enabled_ && static_cast<size_t>(free_idx) < block_refcount_.size()) {
         block_refcount_[free_idx] = 1;
+        refcount_dirty_ = true;
     }
 
     // 清零新分配的块
@@ -479,9 +542,11 @@ ErrorCode Allocator::freeBlock(BlockNo block_no) {
     if (refcount_enabled_ && data_idx < block_refcount_.size()) {
         if (block_refcount_[data_idx] > 1) {
             block_refcount_[data_idx]--;
+            refcount_dirty_ = true;
             return ErrorCode::OK;
         }
         block_refcount_[data_idx] = 0;
+        refcount_dirty_ = true;
     }
 
     bmap.clear(data_idx);
@@ -540,7 +605,21 @@ Result<uint32_t> Allocator::incBlockRef(BlockNo block_no) {
     }
 
     block_refcount_[data_idx]++;
+    refcount_dirty_ = true;
     return Result<uint32_t>::success(block_refcount_[data_idx]);
+}
+
+ErrorCode Allocator::resetBlockRefcounts() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (!loaded_) {
+        return ErrorCode::E_INVALID_PARAM;
+    }
+
+    block_refcount_.assign(superblock_.data_block_count, 0);
+    refcount_enabled_ = true;
+    refcount_dirty_ = true;
+    return ErrorCode::OK;
 }
 
 Result<uint32_t> Allocator::decBlockRef(BlockNo block_no) {
@@ -564,6 +643,7 @@ Result<uint32_t> Allocator::decBlockRef(BlockNo block_no) {
     }
 
     block_refcount_[data_idx]--;
+    refcount_dirty_ = true;
 
     if (block_refcount_[data_idx] == 0) {
         Bitmap bmap(block_bitmap_.data(), superblock_.data_block_count);
@@ -694,8 +774,101 @@ ErrorCode Allocator::checkConsistency(bool fix) {
         }
     }
 
+    if (refcount_enabled_ && block_refcount_.size() == superblock_.data_block_count) {
+        for (uint32_t i = 0; i < superblock_.data_block_count; ++i) {
+            bool allocated = block_bmap.get(i);
+            uint32_t refcount = block_refcount_[i];
+            if (allocated && refcount == 0) {
+                std::cerr << "Inconsistency: allocated block has zero refcount at index "
+                          << i << std::endl;
+                has_error = true;
+                if (fix) {
+                    block_refcount_[i] = 1;
+                    refcount_dirty_ = true;
+                }
+            } else if (!allocated && refcount != 0) {
+                std::cerr << "Inconsistency: free block has non-zero refcount at index "
+                          << i << std::endl;
+                has_error = true;
+                if (fix) {
+                    block_refcount_[i] = 0;
+                    refcount_dirty_ = true;
+                }
+            }
+        }
+    }
+
     if (has_error && fix) {
         // 不在锁内调用 sync，避免死锁
+    }
+
+    return has_error ? ErrorCode::E_INTERNAL : ErrorCode::OK;
+}
+
+ErrorCode Allocator::reconcileUsage(const std::unordered_set<InodeId>& used_inodes,
+                                    const std::unordered_set<BlockNo>& used_blocks,
+                                    bool fix) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (!loaded_) {
+        return ErrorCode::E_INVALID_PARAM;
+    }
+
+    bool has_error = false;
+
+    Bitmap inode_bmap(inode_bitmap_.data(), superblock_.total_inodes);
+    for (InodeId inode_id = 0; inode_id < superblock_.total_inodes; ++inode_id) {
+        bool expected = used_inodes.find(inode_id) != used_inodes.end();
+        bool current = inode_bmap.get(inode_id);
+        if (expected != current) {
+            has_error = true;
+            if (fix) {
+                if (expected) {
+                    inode_bmap.set(inode_id);
+                } else {
+                    inode_bmap.clear(inode_id);
+                }
+                inode_bitmap_dirty_ = true;
+            }
+        }
+    }
+
+    Bitmap block_bmap(block_bitmap_.data(), superblock_.data_block_count);
+    for (uint32_t data_idx = 0; data_idx < superblock_.data_block_count; ++data_idx) {
+        BlockNo abs_block = dataBlockToAbsolute(data_idx);
+        bool expected = used_blocks.find(abs_block) != used_blocks.end();
+        bool current = block_bmap.get(data_idx);
+        if (expected != current) {
+            has_error = true;
+            if (fix) {
+                if (expected) {
+                    block_bmap.set(data_idx);
+                } else {
+                    block_bmap.clear(data_idx);
+                }
+                block_bitmap_dirty_ = true;
+            }
+        }
+
+        if (fix && refcount_enabled_ && data_idx < block_refcount_.size()) {
+            if (expected && block_refcount_[data_idx] == 0) {
+                block_refcount_[data_idx] = 1;
+                refcount_dirty_ = true;
+            } else if (!expected && block_refcount_[data_idx] != 0) {
+                block_refcount_[data_idx] = 0;
+                refcount_dirty_ = true;
+            }
+        }
+    }
+
+    if (fix) {
+        uint32_t actual_used_inodes = inode_bmap.countUsed();
+        uint32_t actual_used_blocks = block_bmap.countUsed();
+        superblock_.used_inodes = actual_used_inodes;
+        superblock_.free_inodes = superblock_.total_inodes - actual_used_inodes;
+        superblock_.used_blocks = actual_used_blocks;
+        superblock_.free_blocks = superblock_.data_block_count - actual_used_blocks;
+        superblock_dirty_ = true;
     }
 
     return has_error ? ErrorCode::E_INTERNAL : ErrorCode::OK;

@@ -50,6 +50,10 @@ public:
     uint32_t getSnapshotCount() const;
     uint32_t getMaxSnapshots() const { return MAX_SNAPSHOTS; }
 
+    ErrorCode rebuildBlockRefcounts();
+    ErrorCode collectUsage(std::unordered_set<InodeId>& used_inodes,
+                           std::unordered_set<BlockNo>& used_blocks) const;
+
     // COW
     bool needsCOW(BlockNo block_no) const;
     Result<BlockNo> performCOW(BlockNo block_no);
@@ -84,6 +88,11 @@ private:
     ErrorCode initIndirectBlock(BlockNo block_no);
     ErrorCode incrementBlockRefs(const Inode& inode);
     ErrorCode decrementBlockRefs(const Inode& inode);
+    ErrorCode incrementBlockRefsNoStats(const Inode& inode);
+    ErrorCode rebuildForInode(InodeId inode_id, std::unordered_set<InodeId>& visited);
+    ErrorCode collectForInode(InodeId inode_id, std::unordered_set<InodeId>& visited,
+                              std::unordered_set<InodeId>& used_inodes,
+                              std::unordered_set<BlockNo>& used_blocks) const;
 
     // 块操作
     ErrorCode readBlockInternal(BlockNo block_no, void* buffer) const;
@@ -103,6 +112,7 @@ private:
     BlockNo snapshot_list_block_;
     bool loaded_;
     bool dirty_;
+    bool count_indirect_blocks_ = true;
 
     mutable SnapshotStats stats_;
     mutable std::mutex mutex_;

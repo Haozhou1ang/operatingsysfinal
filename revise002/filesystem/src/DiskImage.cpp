@@ -399,6 +399,8 @@ MkfsResult mkfs(const std::string& path, const MkfsOptions& options) {
                   << " - " << (sb.inode_bitmap_start + sb.inode_bitmap_blocks - 1) << std::endl;
         std::cout << "  Block bitmap: blocks " << sb.block_bitmap_start 
                   << " - " << (sb.block_bitmap_start + sb.block_bitmap_blocks - 1) << std::endl;
+        std::cout << "  Refcount table: blocks " << sb.refcount_table_start
+                  << " - " << (sb.refcount_table_start + sb.refcount_table_blocks - 1) << std::endl;
         std::cout << "  Inode table: blocks " << sb.inode_table_start 
                   << " - " << (sb.data_block_start - 1) << std::endl;
         std::cout << "  Data blocks: blocks " << sb.data_block_start 
@@ -442,6 +444,25 @@ MkfsResult mkfs(const std::string& path, const MkfsOptions& options) {
         if (err != ErrorCode::OK) {
             result.error = err;
             result.message = "Failed to write block bitmap";
+            return result;
+        }
+    }
+
+    // =========================================================================
+    // 初始化引用计数表
+    // =========================================================================
+
+    std::vector<uint8_t> refcount_table(sb.refcount_table_blocks * BLOCK_SIZE, 0);
+    if (!refcount_table.empty()) {
+        refcount_table[0] = 1;  // 根目录数据块
+    }
+
+    for (uint32_t i = 0; i < sb.refcount_table_blocks; ++i) {
+        err = disk.writeBlock(sb.refcount_table_start + i,
+                              refcount_table.data() + i * BLOCK_SIZE);
+        if (err != ErrorCode::OK) {
+            result.error = err;
+            result.message = "Failed to write refcount table";
             return result;
         }
     }
